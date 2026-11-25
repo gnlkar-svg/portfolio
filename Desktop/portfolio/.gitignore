@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+
+# Database
+*.db
+*.db-journal
+data.db
+
+# Parent directories - ignore everything in parent
+/*
+!/.gitignore
+!/.claude/
+!/.env.example
+!/package.json
+!/package-lock.json
+!/public/
+!/src/
+!/test/

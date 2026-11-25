@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hesabım</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <p class="message" role="status" aria-live="polite" hidden></p>
+    <h1>Hoş geldin</h1>
+    <p class="lead" id="who">Yükleniyor…</p>
+    <form data-api="/api/logout" data-next="/login">
+      <button type="submit" class="secondary">Çıkış yap</button>
+    </form>
+  </main>
+  <script type="module">
+    const res = await fetch("/api/me");
+    if (!res.ok) location.replace("/login");
+    else document.getElementById("who").textContent = `${(await res.json()).email} olarak giriş yaptın.`;
+  </script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

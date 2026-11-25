@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Giriş yap</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main>
+    <h1>Giriş yap</h1>
+    <p class="lead">Hesabına e-posta adresin ve şifrenle gir.</p>
+    <form data-api="/api/login" data-next="/">
+      <p class="message" role="status" aria-live="polite" hidden></p>
+      <label for="email">E-posta</label>
+      <input id="email" name="email" type="email" autocomplete="email" required>
+      <label for="password">Şifre</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <div class="row"><a href="/forgot-password">Şifremi unuttum</a></div>
+      <button type="submit">Giriş yap</button>
+    </form>
+    <p class="links">Hesabın yok mu? <a href="/register">Kayıt ol</a></p>
+  </main>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
