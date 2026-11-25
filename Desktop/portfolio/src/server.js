@@ -3,8 +3,14 @@ import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import express from "express";
 import session from "express-session";
+import passport from "passport";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+import { Strategy as GitHubStrategy } from "passport-github2";
+import swaggerJsdoc from "swagger-jsdoc";
+import swaggerUi from "swagger-ui-express";
 import { openDb } from "./db.js";
 import { createMailer } from "./mailer.js";
+import { newEmailVerificationToken, generateTOTPSecret, verifyTOTPToken, getTOTPQRCode } from "./features.js";
 import {
   checkNewPassword, hashPassword, hashToken, newResetToken, verifyPassword,
 } from "./passwords.js";
@@ -42,6 +48,21 @@ export function createApp({
 } = {}) {
   const app = express();
   const allow = rateLimiter(now);
+
+  // Swagger setup
+  const swaggerSpec = swaggerJsdoc({
+    definition: {
+      openapi: "3.0.0",
+      info: {
+        title: "Portfolio API",
+        version: "1.0.0",
+        description: "Portfolio uygulaması API dokumentasyonu",
+      },
+      servers: [{ url: baseUrl }],
+    },
+    apis: [],
+  });
+
   const q = {
     userByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
     userById: db.prepare("SELECT * FROM users WHERE id = ?"),
@@ -54,6 +75,26 @@ export function createApp({
       "INSERT INTO password_resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)"),
     resetByHash: db.prepare("SELECT * FROM password_resets WHERE token_hash = ?"),
     useReset: db.prepare("UPDATE password_resets SET used_at = ? WHERE id = ? AND used_at IS NULL"),
+    addEmailVerification: db.prepare(
+      "INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES (?, ?, ?)"),
+    emailVerificationByHash: db.prepare("SELECT * FROM email_verifications WHERE token_hash = ?"),
+    verifyEmail: db.prepare("UPDATE email_verifications SET verified_at = ? WHERE id = ?"),
+    setEmailVerified: db.prepare("UPDATE users SET email_verified = 1, email_verified_at = ? WHERE id = ?"),
+    setTOTPSecret: db.prepare("UPDATE users SET totp_secret = ? WHERE id = ?"),
+    enableTOTP: db.prepare("UPDATE users SET totp_enabled = 1 WHERE id = ?"),
+    getProfile: db.prepare("SELECT * FROM user_profiles WHERE user_id = ?"),
+    addOrUpdateProfile: db.prepare(`
+      INSERT INTO user_profiles (user_id, full_name, bio, avatar_url, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET
+        full_name = excluded.full_name,
+        bio = excluded.bio,
+        avatar_url = excluded.avatar_url,
+        updated_at = excluded.updated_at
+    `),
+    addOAuthAccount: db.prepare(
+      "INSERT OR IGNORE INTO oauth_accounts (user_id, provider, provider_id, created_at) VALUES (?, ?, ?, ?)"),
+    getOAuthAccount: db.prepare("SELECT * FROM oauth_accounts WHERE provider = ? AND provider_id = ?"),
   };
 
   app.disable("x-powered-by");
@@ -72,6 +113,52 @@ export function createApp({
     cookie: { httpOnly: true, sameSite: "lax", secure: baseUrl.startsWith("https://") },
   }));
 
+  // Passport configuration
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  passport.serializeUser((user, done) => done(null, user.id));
+  passport.deserializeUser((id, done) => {
+    const user = q.userById.get(id);
+    done(null, user);
+  });
+
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET) {
+    passport.use(new GoogleStrategy({
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: `${baseUrl.replace(/\/$/, "")}/auth/google/callback`,
+    }, (accessToken, refreshToken, profile, done) => {
+      let user = q.userByEmail.get(profile.emails[0].value);
+      if (!user) {
+        const t = now();
+        q.addUser.run(profile.emails[0].value, "", t, t);
+        q.setEmailVerified.run(t, (user = q.userByEmail.get(profile.emails[0].value)).id);
+      }
+      q.addOAuthAccount.run(user.id, "google", profile.id, now());
+      done(null, user);
+    }));
+  }
+
+  if (process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_SECRET) {
+    passport.use(new GitHubStrategy({
+      clientID: process.env.GITHUB_CLIENT_ID,
+      clientSecret: process.env.GITHUB_CLIENT_SECRET,
+      callbackURL: `${baseUrl.replace(/\/$/, "")}/auth/github/callback`,
+      userProfileURL: "https://api.github.com/user",
+    }, (accessToken, refreshToken, profile, done) => {
+      const email = profile.emails?.[0]?.value || `${profile.username}@github.local`;
+      let user = q.userByEmail.get(email);
+      if (!user) {
+        const t = now();
+        q.addUser.run(email, "", t, t);
+        q.setEmailVerified.run(t, (user = q.userByEmail.get(email)).id);
+      }
+      q.addOAuthAccount.run(user.id, "github", profile.id.toString(), now());
+      done(null, user);
+    }));
+  }
+
   app.post("/api/register", async (req, res) => {
     const email = normalizeEmail(req.body?.email);
     if (!email) return res.status(400).json({ error: "Geçerli bir e-posta adresi yaz." });
@@ -80,6 +167,8 @@ export function createApp({
     if (q.userByEmail.get(email)) return res.status(409).json({ error: "Bu e-posta ile zaten bir hesap var." });
     const t = now();
     q.addUser.run(email, await hashPassword(req.body.password), t, t);
+    const user = q.userByEmail.get(email);
+    q.setEmailVerified.run(t, user.id);
     res.status(201).json({ message: "Hesap oluşturuldu. Şimdi giriş yapabilirsin." });
   });
 
@@ -96,8 +185,86 @@ export function createApp({
     });
   });
 
+  app.post("/api/verify-email", (req, res) => {
+    const token = String(req.body?.token ?? "");
+    const ev = token && q.emailVerificationByHash.get(hashToken(token));
+    if (!ev || ev.verified_at !== null || ev.expires_at <= now()) {
+      return res.status(400).json({ error: "Doğrulama bağlantısı geçersiz veya süresi dolmuş." });
+    }
+    const t = now();
+    q.verifyEmail.run(t, ev.id);
+    q.setEmailVerified.run(t, ev.user_id);
+    res.json({ message: "E-posta doğrulandı. Şimdi giriş yapabilirsin." });
+  });
+
+  app.post("/api/2fa/setup", async (req, res) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: "Giriş yapmalısın." });
+    }
+    const user = q.userById.get(req.session.userId);
+    if (!user) return res.status(401).json({ error: "Giriş yapmalısın." });
+
+    const secret = await generateTOTPSecret(user.email);
+    q.setTOTPSecret.run(secret.base32, user.id);
+
+    const qrCode = await getTOTPQRCode(secret);
+    res.json({ secret: secret.base32, qrCode });
+  });
+
+  app.post("/api/2fa/verify", async (req, res) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: "Giriş yapmalısın." });
+    }
+    const user = q.userById.get(req.session.userId);
+    if (!user || !user.totp_secret) {
+      return res.status(400).json({ error: "2FA kaydedilmedi." });
+    }
+
+    const token = String(req.body?.token ?? "");
+    if (!verifyTOTPToken(user.totp_secret, token)) {
+      return res.status(400).json({ error: "TOTP token hatalı." });
+    }
+
+    q.enableTOTP.run(user.id);
+    res.json({ message: "2FA etkinleştirildi." });
+  });
+
+  app.get("/api/profile", (req, res) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: "Giriş yapmalısın." });
+    }
+    const profile = q.getProfile.get(req.session.userId);
+    res.json(profile || {});
+  });
+
+  app.put("/api/profile", (req, res) => {
+    if (!req.session.userId) {
+      return res.status(401).json({ error: "Giriş yapmalısın." });
+    }
+    const { full_name, bio, avatar_url } = req.body;
+    const t = now();
+    q.addOrUpdateProfile.run(req.session.userId, full_name || null, bio || null, avatar_url || null, t);
+    res.json({ message: "Profil güncellendi." });
+  });
+
   app.post("/api/logout", (req, res) => {
     req.session.destroy(() => res.json({ message: "Çıkış yapıldı." }));
+  });
+
+  // Google OAuth
+  app.get("/auth/google", passport.authenticate("google", { scope: ["email", "profile"] }));
+  app.get("/auth/google/callback", passport.authenticate("google", { failureRedirect: "/login" }), (req, res) => {
+    req.session.userId = req.user.id;
+    req.session.loginAt = now();
+    res.redirect("/");
+  });
+
+  // GitHub OAuth
+  app.get("/auth/github", passport.authenticate("github", { scope: ["user:email"] }));
+  app.get("/auth/github/callback", passport.authenticate("github", { failureRedirect: "/login" }), (req, res) => {
+    req.session.userId = req.user.id;
+    req.session.loginAt = now();
+    res.redirect("/");
   });
 
   app.get("/api/me", (req, res) => {
@@ -147,6 +314,8 @@ export function createApp({
     q.closeOpenResets.run(t, reset.user_id);
     req.session.destroy(() => res.json({ message: "Şifren değişti. Yeni şifrenle giriş yapabilirsin." }));
   });
+
+  app.use("/api-docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
   app.get("/", (req, res) => res.sendFile(path.join(PUBLIC_DIR, "index.html")));
   app.get("/reset-password", (req, res) => res.sendFile(path.join(PUBLIC_DIR, "reset-password.html")));
